@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -73,6 +74,26 @@ func addTools(s *server.MCPServer) {
 			message, err := request.RequireString("message")
 			if err != nil {
 				return mcp.NewToolResultError(err.Error()), nil
+			}
+			// Opt-in delay and entry evidence for idle lifecycle tests. Keep
+			// the normal echo behavior and advertised tool catalog unchanged.
+			if rawDelay := os.Getenv("MCP_PROXY_TEST_ECHO_DELAY"); rawDelay != "" {
+				delay, err := time.ParseDuration(rawDelay)
+				if err != nil {
+					return nil, fmt.Errorf("echo delay: %w", err)
+				}
+				if path := os.Getenv("MCP_PROXY_TEST_ECHO_ENTER_FILE"); path != "" {
+					if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())+"\n"), 0600); err != nil {
+						return nil, fmt.Errorf("echo entry marker: %w", err)
+					}
+				}
+				timer := time.NewTimer(delay)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
 			return mcp.NewToolResultText(message), nil
 		},

@@ -136,7 +136,7 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		c.needManualStart = true
 	}
 	if conf.LazyStart {
-		c.lazy = &lazyBackend{}
+		c.lazy = &lazyBackend{idleTimeout: time.Duration(conf.IdleTimeout)}
 		return c, nil
 	}
 	// The first transport is built here: for stdio that spawns the subprocess,
@@ -481,6 +481,11 @@ func redactURLCredentials(err error) error {
 // transports, so requestTimeout is left zero for them and the caller's context
 // is forwarded unchanged.
 func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	release, err := c.acquireIdle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	cl := c.getClient()
 	if cl == nil {
 		return nil, errors.New("downstream is not connected")
@@ -590,54 +595,65 @@ func (c *Client) startPingTask(ctx context.Context) {
 			slog.Debug("Context done, stopping ping", "client", c.name)
 			return
 		case <-ticker.C:
-			pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
-			err := c.probe(pingCtx)
-			cancel()
-			if ctx.Err() != nil {
-				return
-			}
-			if err == nil {
-				if failCount > 0 {
-					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+			func() {
+				release, ok := c.acquireIdleProbe()
+				if !ok {
 					failCount = 0
+					return
 				}
-				c.health.Store(int32(healthOK))
-				continue
-			}
-			if !isTransportFailure(err) && !(c.lazy != nil && c.getClient() == nil) {
-				// A downstream that answers with a JSON-RPC error is alive - it
-				// may simply not implement the probe. Only a broken connection
-				// counts against it.
-				slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", redactURLCredentials(err))
-				if failCount > 0 {
-					slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
-					failCount = 0
+				defer release()
+				pingCtx, cancel := context.WithTimeout(ctx, pingTimeout)
+				err := c.probe(pingCtx)
+				cancel()
+				if c.idleBusinessActive() {
+					return
 				}
+				if ctx.Err() != nil {
+					return
+				}
+				if err == nil {
+					if failCount > 0 {
+						slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+						failCount = 0
+					}
+					c.health.Store(int32(healthOK))
+					return
+				}
+				if !isTransportFailure(err) && !(c.lazy != nil && c.getClient() == nil) {
+					// A downstream that answers with a JSON-RPC error is alive - it
+					// may simply not implement the probe. Only a broken connection
+					// counts against it.
+					slog.Debug("MCP health probe answered with an error, treating as alive", "client", c.name, "err", redactURLCredentials(err))
+					if failCount > 0 {
+						slog.Info("MCP health probe recovered", "client", c.name, "failures", failCount)
+						failCount = 0
+					}
+					c.health.Store(int32(healthOK))
+					return
+				}
+
+				failCount++
+				slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
+				if failCount < pingFailureThreshold {
+					return
+				}
+				c.health.Store(int32(healthFailed))
+
+				if !autoReconnect {
+					return
+				}
+				// Rebuild the downstream from scratch. connect() swaps the live
+				// transport in, so requests that arrive during the rebuild keep
+				// using the old one until the new one is ready.
+				rErr := c.reconnect(ctx)
+				if rErr != nil {
+					slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
+					return
+				}
+				slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
+				failCount = 0
 				c.health.Store(int32(healthOK))
-				continue
-			}
-
-			failCount++
-			slog.Warn("MCP health probe failed", "client", c.name, "err", redactURLCredentials(err), "failures", failCount)
-			if failCount < pingFailureThreshold {
-				continue
-			}
-			c.health.Store(int32(healthFailed))
-
-			if !autoReconnect {
-				continue
-			}
-			// Rebuild the downstream from scratch. connect() swaps the live
-			// transport in, so requests that arrive during the rebuild keep
-			// using the old one until the new one is ready.
-			rErr := c.reconnect(ctx)
-			if rErr != nil {
-				slog.Warn("Failed to reconnect downstream", "client", c.name, "err", redactURLCredentials(rErr))
-				continue
-			}
-			slog.Info("Reconnected downstream", "client", c.name, "afterFailures", failCount)
-			failCount = 0
-			c.health.Store(int32(healthOK))
+			}()
 		}
 	}
 }
@@ -775,6 +791,11 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 			// unanswered prompt wedges the whole route exactly as an unanswered
 			// tool call would.
 			prompts = append(prompts, server.ServerPrompt{Prompt: prompt, Handler: func(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+				release, err := c.acquireIdle(ctx)
+				if err != nil {
+					return nil, err
+				}
+				defer release()
 				live := c.getClient()
 				if live == nil {
 					return nil, errors.New("downstream is not connected")
@@ -878,6 +899,11 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 // per-request bound: an unanswered resource read occupies the single stdio
 // channel and takes the whole downstream unhealthy for every caller.
 func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
+	release, err := c.acquireIdle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	cl := c.getClient()
 	if cl == nil {
 		return nil, errors.New("downstream is not connected")

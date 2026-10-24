@@ -134,3 +134,10 @@ is needed. The first connection can take longer while the backend starts; choose
 your MCP client's startup timeout accordingly. See
 [on-demand startup configuration](CONFIGURATION.md#on-demand-backend-startup)
 for activation, retries and sharing limits.
+
+To free an idle lazy backend, add `"idleTimeout": "10m"` next to
+`"lazyStart": true` in its entry. Its next request reinitializes it and refreshes
+the catalog. Open SSE connections alone do not prevent unloading, but active
+forwarded calls do. The default is disabled. Only enable this when losing
+backend in-memory session/model state is acceptable; remote HTTP/SSE services
+are disconnected, not shut down. See [idle shutdown configuration](CONFIGURATION.md#idle-backend-shutdown).

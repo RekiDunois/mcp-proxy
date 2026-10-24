@@ -32,6 +32,13 @@ type lazyBackend struct {
 	everReady bool
 	lastErr   error
 	retryAt   time.Time
+
+	idleTimeout  time.Duration
+	idleDeadline time.Time
+	idleTimer    *time.Timer
+	active       int
+	probing      bool
+	closing      chan struct{}
 }
 
 // bindLazy is called once before publishing the HTTP route.
@@ -43,6 +50,9 @@ func (c *Client) bindLazy(ctx context.Context, info mcp.Implementation, s *serve
 func (l *lazyBackend) stop() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.idleTimer != nil {
+		l.idleTimer.Stop()
+	}
 	if l.cancel != nil {
 		l.cancel()
 	}
@@ -64,6 +74,8 @@ func (l *lazyBackend) startLocked(c *Client) *lazyAttempt {
 		l.attempt = nil
 		if err == nil {
 			l.ready, l.everReady = true, true
+			l.idleDeadline = time.Now().Add(l.idleTimeout)
+			l.scheduleIdleLocked(c)
 			if c.needPing {
 				c.pingOnce.Do(func() { go c.startPingTask(l.ctx) })
 			}
@@ -100,6 +112,18 @@ func waitLazy(ctx, lifetime context.Context, a *lazyAttempt) error {
 func (c *Client) ensureStarted(ctx context.Context) error {
 	l := c.lazy
 	l.mu.Lock()
+	for l.closing != nil {
+		done := l.closing
+		l.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-l.ctx.Done():
+			return l.ctx.Err()
+		case <-done:
+		}
+		l.mu.Lock()
+	}
 	if c.closed.Load() || l.ctx.Err() != nil {
 		l.mu.Unlock()
 		return errors.New("client is closed")
@@ -123,6 +147,10 @@ func (c *Client) ensureStarted(ctx context.Context) error {
 
 func (l *lazyBackend) reconnect(c *Client, ctx context.Context) error {
 	l.mu.Lock()
+	if l.idleTimeout > 0 && (l.active > 0 || l.closing != nil || !l.everReady) {
+		l.mu.Unlock()
+		return errors.New("idle backend recovery deferred")
+	}
 	if c.closed.Load() || l.ctx.Err() != nil {
 		l.mu.Unlock()
 		return errors.New("client is closed")
@@ -137,11 +165,24 @@ func (l *lazyBackend) reconnect(c *Client, ctx context.Context) error {
 
 func (c *Client) lazyHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := c.ensureStarted(r.Context()); err != nil {
+		var err error
+		release := func() {}
+		if c.lazy.idleTimeout > 0 {
+			release, err = c.acquireIdle(r.Context())
+		} else {
+			err = c.ensureStarted(r.Context())
+		}
+		if err != nil {
 			if r.Context().Err() == nil {
 				http.Error(w, "Backend unavailable", http.StatusServiceUnavailable)
 			}
 			return
+		}
+		// SSE/streamable GET streams are subscriptions, not active work.
+		if r.Method == http.MethodGet {
+			release()
+		} else {
+			defer release()
 		}
 		next.ServeHTTP(w, r)
 	})
