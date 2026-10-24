@@ -264,9 +264,39 @@ Lazy reconnection closes the old transport before creating a replacement, so
 heavy stdio processes do not overlap. If cleanup cannot be confirmed, replacement
 is stopped instead of risking another live process; resolve the old process and
 restart the gateway. Dormant lazy routes count as ready; an attempted but failed
-backend makes readiness degraded. No idle unloading is performed.
+backend makes readiness degraded. Idle unloading is disabled unless explicitly configured.
 
 This shares transport/process resources, not application isolation guarantees.
 Backends with global mutable session state must themselves support concurrent
 clients; the proxy does not add database locks, user-session isolation, or replay
 failed business calls.
+
+### Idle backend shutdown
+
+Set `"lazyStart": true, "idleTimeout": "10m"` on a backend entry (beside
+`command`/`url`, not in `options`) to release it after ten minutes without
+active requests. Omitted or `"0s"` disables this feature. Positive durations
+require `lazyStart`; negative or sub-millisecond durations are rejected. There
+is no inherited proxy-wide default. Configuration changes require a restart.
+
+The idle interval begins when the last active request finishes. Forwarded
+tool, prompt and resource calls keep the backend alive, including asynchronous
+SSE dispatch. Open frontend SSE/GET streams do not pin it. HTTP/catalog activity
+refreshes the interval; health probes do not, and probes are paused while work
+is active. Dormant routes remain ready. The next authorized request waits for
+cleanup, then shares the existing lazy initialization and catalog discovery
+with concurrent callers. No business call is automatically replayed.
+
+For stdio this closes and reaps the owned child process, allowing its memory
+to be released. For remote SSE/HTTP it only closes this proxy's upstream
+connection: it cannot stop the remote server or guarantee remote memory release.
+An intentional idle stop wakes on demand even with `autoReconnect: false`. A
+confirmed unhealthy backend is not relabeled idle to bypass that failure policy.
+Uncertain cleanup blocks replacement until the operator resolves it and restarts.
+
+Opt in only for backends that tolerate reinitialization. In-memory sessions,
+loaded models, subscriptions and background work that outlive a request can be
+lost. Cancellation/timeouts end the proxy's active call; they do not prove that
+an arbitrary backend finished its own detached work. No session-state migration
+or persistence guarantee is added. Frontend connections stay mounted, but
+application-level backend state must be restored by the backend or caller.

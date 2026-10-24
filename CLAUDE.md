@@ -93,3 +93,12 @@ as ready. Request cancellation only stops that waiter; the gateway context owns
 the backend. Lazy replacement closes the old transport first and refuses a new
 one after uncertain cleanup. Existing eager swap/retry behavior remains. Read
 `plan/lazy-start/` for this extension's bounded execution and test scope.
+
+Per-backend `idleTimeout` requires lazyStart and defaults to zero/disabled.
+`idle.go` extends the same coordinator with activity leases and a close barrier.
+HTTP SSE POST returns before MCP work, so actual tool/prompt/resource forwarding
+leases its transport separately; open GET streams do not pin it. Health probes
+never refresh idle time or wake dormant backends. Keep close/start ordering,
+confirmed-failure policy and cleanup-uncertain ownership intact. Idle stop loses
+backend in-memory session state; remote transports only disconnect. Config is
+loaded once, not hot-reloaded. Current scope/tests: `plan/idle-timeout/`.

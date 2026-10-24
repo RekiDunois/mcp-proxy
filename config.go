@@ -225,6 +225,8 @@ type MCPProxyConfigV2 struct {
 type MCPClientConfigV2 struct {
 	// LazyStart defers this backend until its first authenticated HTTP request.
 	LazyStart bool `json:"lazyStart,omitempty"`
+	// IdleTimeout unloads an idle lazy backend; zero disables unloading.
+	IdleTimeout Duration `json:"idleTimeout,omitempty"`
 
 	TransportType MCPClientType `json:"transportType,omitempty"`
 
@@ -449,6 +451,12 @@ func validateConfig(config *Config) error {
 		field := fmt.Sprintf("mcpServers[%q]", name)
 		if serverConfig == nil {
 			return fmt.Errorf("%s cannot be null", field)
+		}
+		if err := validateDuration(field+".idleTimeout", serverConfig.IdleTimeout); err != nil {
+			return err
+		}
+		if serverConfig.IdleTimeout > 0 && !serverConfig.LazyStart {
+			return fmt.Errorf("%s: idleTimeout requires lazyStart", field)
 		}
 		if serverConfig.LazyStart && serverConfig.Options.panicIfInvalid() {
 			return fmt.Errorf("%s: lazyStart cannot be combined with panicIfInvalid", field)
