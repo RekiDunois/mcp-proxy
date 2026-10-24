@@ -437,3 +437,36 @@ func TestLoadInheritsProxyOptions(t *testing.T) {
 		t.Errorf("overridden reconnectInterval = %v, want 2s", got)
 	}
 }
+
+func TestLazyStartOptions(t *testing.T) {
+	for _, tc := range []struct {
+		name, field, options string
+		wantLazy, wantErr    bool
+	}{
+		{name: "omitted"},
+		{name: "false", field: `,"lazyStart":false`},
+		{name: "true", field: `,"lazyStart":true`, wantLazy: true},
+		{name: "inherited fail-fast conflict", field: `,"lazyStart":true`, options: `,"options":{"panicIfInvalid":true}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "config.json")
+			data := `{"mcpProxy":{"baseURL":"http://localhost:9090","addr":":9090","name":"test","version":"1","type":"streamable-http"` + tc.options + `},"mcpServers":{"fixture":{"command":"not-run"` + tc.field + `}}}`
+			if err := os.WriteFile(p, []byte(data), 0600); err != nil {
+				t.Fatal(err)
+			}
+			c, err := load(p, false, false, "", 10)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "lazyStart cannot") {
+					t.Fatalf("wanted conflict, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.McpServers["fixture"].LazyStart != tc.wantLazy {
+				t.Fatal("wrong lazy option")
+			}
+		})
+	}
+}

@@ -81,3 +81,15 @@ follow list cursors, so a pagination regression only shows up if both break.
 ## Docs
 
 `docs/CONFIGURATION.md`, `docs/USAGE.md`, `docs/DEPLOYMENT.md` document the config schema, CLI flags/endpoints, and deployment. Update them when changing flags or config fields. `docs/index.html` is the online Claude-config converter published via GitHub Pages.
+
+## Lazy startup extension
+
+Per-backend `lazyStart` (default false, outside `options`) defers raw client
+construction. `lazy.go` owns shared activation attempts and waiters, while
+`client.go` still owns MCP initialization/catalog/forwarding and transport
+cleanup. `http.go` publishes lazy routes before activation, inside the existing
+auth middleware; health probes do not activate them. Dormant lazy routes count
+as ready. Request cancellation only stops that waiter; the gateway context owns
+the backend. Lazy replacement closes the old transport first and refuses a new
+one after uncertain cleanup. Existing eager swap/retry behavior remains. Read
+`plan/lazy-start/` for this extension's bounded execution and test scope.

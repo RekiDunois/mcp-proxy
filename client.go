@@ -70,6 +70,10 @@ type Client struct {
 	clientInfo mcp.Implementation
 	mcpServer  *server.MCPServer
 	pingOnce   sync.Once
+
+	lazy *lazyBackend
+	// cleanupErr is guarded by connectMu; uncertain teardown forbids replacement.
+	cleanupErr error
 }
 
 func (c *Client) Health() clientHealth {
@@ -130,6 +134,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 	case *SSEMCPClientConfig, *StreamableMCPClientConfig:
 		c.needPing = true
 		c.needManualStart = true
+	}
+	if conf.LazyStart {
+		c.lazy = &lazyBackend{}
+		return c, nil
 	}
 	// The first transport is built here: for stdio that spawns the subprocess,
 	// so a missing command fails at startup rather than on first use.
@@ -195,7 +203,7 @@ func (c *Client) getClient() *client.Client {
 // one), then (re)registers the downstream's tools/prompts/resources. Tool
 // handlers resolve the live client via getClient at call time, so the swap is
 // transparent to in-flight and future requests.
-func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
+func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) (result error) {
 	c.connectMu.Lock()
 	defer c.connectMu.Unlock()
 
@@ -206,6 +214,19 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	// Reuse the transport built at construction for the very first attempt;
 	// after that (or after a failed first attempt, which nils it out) build a
 	// fresh one so a dead transport is never reused.
+	if c.cleanupErr != nil {
+		return c.cleanupErr
+	}
+	if c.lazy != nil {
+		// A heavy stdio backend must be gone before its replacement starts.
+		if old := c.getClient(); old != nil {
+			if err := closeTransport(old); err != nil {
+				c.cleanupErr = fmt.Errorf("%w: %v", errCleanupUncertain, err)
+				return c.cleanupErr
+			}
+			c.forget(old)
+		}
+	}
 	raw := c.getClient()
 	if raw == nil || c.hasConnected {
 		var err error
@@ -219,8 +240,16 @@ func (c *Client) connect(ctx context.Context, clientInfo mcp.Implementation, mcp
 	// Until the swap below succeeds, this transport is not owned by the client
 	// and must be closed on the way out.
 	defer func() {
-		if !connected {
-			_ = raw.Close()
+		if !connected || (c.lazy != nil && result != nil) {
+			if err := closeTransport(raw); err != nil && c.lazy != nil {
+				c.cleanupErr = fmt.Errorf("%w: %v", errCleanupUncertain, err)
+				c.mu.Lock()
+				c.client = raw
+				c.mu.Unlock()
+				result = errors.Join(result, c.cleanupErr)
+			} else {
+				c.forget(raw)
+			}
 		}
 	}()
 
@@ -345,6 +374,9 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 // reconnect rebuilds a dropped downstream using the details remembered at
 // first connect. It is only called from the ping task.
 func (c *Client) reconnect(ctx context.Context) error {
+	if c.lazy != nil {
+		return c.lazy.reconnect(c, ctx)
+	}
 	return c.connect(ctx, c.clientInfo, c.mcpServer)
 }
 
@@ -572,7 +604,7 @@ func (c *Client) startPingTask(ctx context.Context) {
 				c.health.Store(int32(healthOK))
 				continue
 			}
-			if !isTransportFailure(err) {
+			if !isTransportFailure(err) && !(c.lazy != nil && c.getClient() == nil) {
 				// A downstream that answers with a JSON-RPC error is alive - it
 				// may simply not implement the probe. Only a broken connection
 				// counts against it.
@@ -861,10 +893,21 @@ func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceReque
 
 func (c *Client) Close() error {
 	c.closed.Store(true)
+	if c.lazy != nil {
+		c.lazy.stop()
+		// Cancellation unblocks initialization/catalog. Wait without holding mu
+		// so no in-progress constructor can publish an unowned process later.
+		c.connectMu.Lock()
+		defer c.connectMu.Unlock()
+	}
 	cl := c.getClient()
 	if cl == nil {
 		return nil
 	}
+	return closeTransport(cl)
+}
+
+func closeTransport(cl *client.Client) error {
 	err := cl.Close()
 	// A stdio subprocess that already died, or that exits non-zero when its
 	// stdin is closed (many MCP servers do), is not a failure to close it.
@@ -872,7 +915,7 @@ func (c *Client) Close() error {
 	// otherwise clean shutdown.
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		slog.Warn("Downstream server exited with an error", "client", c.name, "err", err)
+		slog.Warn("Downstream server exited with an error", "err", err)
 		return nil
 	}
 	return err
