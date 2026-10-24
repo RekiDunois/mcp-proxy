@@ -262,7 +262,7 @@ func startHTTPServer(config *Config) error {
 		defer clientsMu.Unlock()
 		for name, client := range clients {
 			health := client.Health()
-			if health == healthUnknown {
+			if health == healthUnknown && client.lazy == nil {
 				// Created but never connected: it has no route, so there is
 				// nothing to route around.
 				continue
@@ -307,7 +307,11 @@ func startHTTPServer(config *Config) error {
 					mcpRoute += "/"
 				}
 				slog.Info("Handling requests", "client", name, "route", mcpRoute)
-				httpMux.Handle(mcpRoute, chainMiddleware(server.handler, middlewares...))
+				handler := server.handler
+				if mcpClient.lazy != nil {
+					handler = mcpClient.lazyHandler(handler)
+				}
+				httpMux.Handle(mcpRoute, chainMiddleware(handler, middlewares...))
 				httpServer.RegisterOnShutdown(func() {
 					slog.Info("Shutting down", "client", name)
 					if cErr := mcpClient.Close(); cErr != nil {
@@ -315,6 +319,23 @@ func startHTTPServer(config *Config) error {
 					}
 				})
 			})
+		}
+
+		if clientConfig.LazyStart {
+			mcpClient, err := newMCPClient(name, clientConfig)
+			if err != nil {
+				return clientStartupError(name, clientConfig, err)
+			}
+			server, err := newMCPServer(name, config.McpProxy, clientConfig)
+			if err != nil {
+				return clientStartupError(name, clientConfig, err)
+			}
+			mcpClient.bindLazy(ctx, info, server.mcpServer)
+			clientsMu.Lock()
+			clients[name] = mcpClient
+			clientsMu.Unlock()
+			mountRoute(mcpClient, server)
+			continue
 		}
 
 		errorGroup.Go(func() error {

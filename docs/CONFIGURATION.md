@@ -216,3 +216,57 @@ Notes:
   them, so a fleet-wide setting can be declared once. `disabled` is per-server only and is
   not inherited.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
+
+### On-demand backend startup
+
+Set `lazyStart: true` on an individual `mcpServers` entry (not in `options`):
+
+```json
+{
+  "mcpServers": {
+    "knowledge": {
+      "command": "bun",
+      "args": ["/absolute/path/to/mcp-server.js"],
+      "lazyStart": true,
+      "options": {"autoReconnect": true}
+    }
+  }
+}
+```
+
+Omitting `lazyStart` or setting it to false preserves eager startup. It has no
+proxy-wide inherited default. Existing `options`, including authentication and
+`autoReconnect`, keep their inheritance rules. `lazyStart: true` cannot be
+combined with an effective `panicIfInvalid: true`; config validation rejects
+that combination rather than letting a later request terminate the gateway.
+
+The proxy mounts the usual authenticated endpoint immediately, but creates no
+stdio process and opens no remote connection until its first authorized HTTP
+request. Concurrent callers share one startup attempt and wait for initialization
+and catalog registration before reaching the MCP handler. Subsequent callers
+reuse that configured backend. Unauthorized requests and health probes do not
+activate it. A disconnected caller does not cancel shared startup.
+
+The trigger includes MCP initialize and tools/list, not just tools/call. A client
+that connects all configured endpoints at session start may therefore activate
+all of them. For an HTTP/SSE upstream this only defers connection; the proxy does
+not launch the remote server. Sharing is per configured entry in one proxy
+process, not across independent gateway processes or differently named entries.
+
+A failed first attempt returns HTTP 503 without removing the route. Later
+requests may retry after `reconnectInterval`. With `autoReconnect: true`, first
+access also enables background initial retry at that interval, followed by the
+existing health/reconnect behavior after success. Without it, an already
+successfully activated backend is not automatically restarted after failure.
+Permanent OAuth authorization errors still require operator intervention.
+
+Lazy reconnection closes the old transport before creating a replacement, so
+heavy stdio processes do not overlap. If cleanup cannot be confirmed, replacement
+is stopped instead of risking another live process; resolve the old process and
+restart the gateway. Dormant lazy routes count as ready; an attempted but failed
+backend makes readiness degraded. No idle unloading is performed.
+
+This shares transport/process resources, not application isolation guarantees.
+Backends with global mutable session state must themselves support concurrent
+clients; the proxy does not add database locks, user-session isolation, or replay
+failed business calls.

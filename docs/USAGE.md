@@ -125,3 +125,12 @@ running when you authorized, restart it now - the new token won't be
 picked up otherwise. After that, tokens refresh automatically as they
 expire with no further restarts needed. Re-run `-authorize` only if the
 server reports the token is no longer valid (e.g. access was revoked).
+
+### Lazy backends
+
+For a backend configured with `lazyStart: true`, use the same HTTP MCP URL and
+authentication as an eager backend. No per-client launcher or extra bridge process
+is needed. The first connection can take longer while the backend starts; choose
+your MCP client's startup timeout accordingly. See
+[on-demand startup configuration](CONFIGURATION.md#on-demand-backend-startup)
+for activation, retries and sharing limits.

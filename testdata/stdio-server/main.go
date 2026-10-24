@@ -26,6 +26,22 @@ import (
 const paginationLimit = 2
 
 func main() {
+	// Opt-in evidence for the lazy-start lifecycle tests; normal fixture runs
+	// do not create or touch any marker file.
+	if path := os.Getenv("MCP_PROXY_TEST_START_FILE"); path != "" {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+		if err == nil {
+			_, err = fmt.Fprintln(f, os.Getpid())
+			closeErr := f.Close()
+			if err == nil {
+				err = closeErr
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stdio-server startup marker: %v\n", err)
+			os.Exit(1)
+		}
+	}
 	if err := server.ServeStdio(newServer()); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(os.Stderr, "stdio-server: %v\n", err)
 		os.Exit(1)
